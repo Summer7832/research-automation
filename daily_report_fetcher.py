@@ -1,6 +1,6 @@
 # daily_report_fetcher.py
 # 每日18:00自动抓取指定板块研报并生成AI摘要
-# 修正版：直接从页面嵌入式数据中提取研报列表
+# 修正版：从研报详情页获取真实PDF下载链接
 
 import os
 import re
@@ -12,14 +12,11 @@ import glob
 import subprocess
 
 # ================== 配置 ==================
-# 关注的板块ID（从东方财富行业研报页面确认）
 TARGET_SECTORS = {
     "证券Ⅱ": "473",
     "保险Ⅱ": "474",
-    # "银行Ⅱ": 暂未找到正确ID，可先忽略或后续补充
 }
 PDF_FOLDER = "data/pdfs/"
-MAX_REPORTS_PER_SECTOR = 10
 MAX_TOTAL = 20
 # ==========================================
 
@@ -34,18 +31,15 @@ def fetch_reports_from_page():
         resp = requests.get(url, headers=headers, timeout=15)
         resp.encoding = "utf-8"
         html = resp.text
-        # 使用正则提取 initdata 的 JSON 字符串
         pattern = r'var initdata\s*=\s*({.*?});\s*</script>'
         match = re.search(pattern, html, re.DOTALL)
         if not match:
             print("未找到 initdata，可能页面结构已变化")
             return []
         json_str = match.group(1)
-        # 处理JavaScript中的一些非标准格式（如注释、尾部逗号），但一般可以直接解析
         try:
             data_obj = json.loads(json_str)
         except json.JSONDecodeError:
-            # 如果直接解析失败，尝试去除尾部多余逗号
             json_str = re.sub(r',\s*}', '}', json_str)
             json_str = re.sub(r',\s*]', ']', json_str)
             data_obj = json.loads(json_str)
@@ -56,15 +50,45 @@ def fetch_reports_from_page():
         print(f"获取研报列表失败: {e}")
         return []
 
-def download_pdf(report, save_path):
-    """下载研报PDF（根据 report 中的 encodeUrl 构造下载链接）"""
-    encode_url = report.get("encodeUrl")
-    if not encode_url:
-        return False
-    # 构造PDF下载链接（东方财富研报PDF下载地址模式）
-    pdf_url = f"https://pdf.dfcfw.com/pdf/H3_{encode_url}.pdf"
+def get_pdf_url_from_detail(info_code):
+    """从研报详情页获取PDF下载链接"""
+    detail_url = f"https://data.eastmoney.com/report/{info_code}.html"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://data.eastmoney.com/report/"
+    }
     try:
-        headers = {"User-Agent": "Mozilla/5.0"}
+        resp = requests.get(detail_url, headers=headers, timeout=10)
+        resp.encoding = "utf-8"
+        # 在页面中搜索 .pdf 链接
+        # 常见格式：https://pdf.dfcfw.com/pdf/H3_xxx.pdf 或 /pdf/xxx.pdf
+        pdf_pattern = r'(https?://[^\s"\']+\.pdf)'
+        match = re.search(pdf_pattern, resp.text, re.IGNORECASE)
+        if match:
+            pdf_url = match.group(1)
+            # 如果链接是相对路径，补全
+            if pdf_url.startswith('/'):
+                pdf_url = 'https://data.eastmoney.com' + pdf_url
+            return pdf_url
+        # 备选：搜索 encodeUrl 并构造
+        encode_match = re.search(r'"encodeUrl":"([^"]+)"', resp.text)
+        if encode_match:
+            encode_url = encode_match.group(1)
+            return f"https://pdf.dfcfw.com/pdf/H3_{encode_url}.pdf"
+        return None
+    except Exception as e:
+        print(f"获取详情页失败 {info_code}: {e}")
+        return None
+
+def download_pdf(pdf_url, save_path):
+    """下载PDF文件"""
+    if not pdf_url:
+        return False
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://data.eastmoney.com/report/"
+        }
         resp = requests.get(pdf_url, headers=headers, timeout=30, stream=True)
         if resp.status_code == 200:
             with open(save_path, "wb") as f:
@@ -79,7 +103,6 @@ def download_pdf(report, save_path):
         return False
 
 def clean_old_pdfs(days=30):
-    """清理超过指定天数的旧PDF"""
     cutoff = datetime.now() - timedelta(days=days)
     for pdf_file in glob.glob(os.path.join(PDF_FOLDER, "*.pdf")):
         mtime = datetime.fromtimestamp(os.path.getmtime(pdf_file))
@@ -96,14 +119,11 @@ def main():
         print("未能获取到任何研报，请检查网络或页面结构。")
         return
 
-    # 按行业ID过滤
     target_ids = set(TARGET_SECTORS.values())
     filtered = [r for r in all_reports if r.get("industryCode") in target_ids]
     print(f"根据板块过滤后，共 {len(filtered)} 份研报")
 
-    # 按日期排序（最新的在前）
     filtered.sort(key=lambda x: x.get("publishDate", ""), reverse=True)
-    # 去重（按标题去重）
     seen = set()
     unique = []
     for r in filtered:
@@ -111,16 +131,15 @@ def main():
         if title and title not in seen:
             seen.add(title)
             unique.append(r)
-    # 限制数量
     unique = unique[:MAX_TOTAL]
     print(f"去重后最终下载 {len(unique)} 份研报")
 
     downloaded = 0
     for report in unique:
         title = report.get("title", "未命名")
-        # 生成安全的文件名
+        info_code = report.get("infoCode", "")
         safe_title = re.sub(r'[\\/*?:"<>|]', "_", title)
-        date_str = report.get("publishDate", "")[:10]  # 取日期部分
+        date_str = report.get("publishDate", "")[:10]
         if date_str:
             filename = f"{date_str}_{safe_title}.pdf"
         else:
@@ -131,12 +150,13 @@ def main():
             downloaded += 1
             continue
         print(f"正在下载: {title} ...")
-        if download_pdf(report, filepath):
+        pdf_url = get_pdf_url_from_detail(info_code)
+        if pdf_url and download_pdf(pdf_url, filepath):
             downloaded += 1
             print(f"  ✅ 下载成功")
         else:
             print(f"  ❌ 下载失败")
-        time.sleep(1)  # 避免请求过快
+        time.sleep(1)
 
     print(f"下载完成: {downloaded}/{len(unique)}")
     clean_old_pdfs(30)
