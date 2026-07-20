@@ -1,19 +1,12 @@
 # daily_report_fetcher.py
 # 每日抓取指定行业（证券、银行、保险）+ 补足热门板块研报，生成 Markdown 报告
+# 使用 requests 直接调用东方财富 API 获取热门板块
 
 import os
 import re
 import json
 import requests
 from datetime import datetime
-
-# 尝试导入 akshare，用于获取热门板块
-try:
-    import akshare as ak
-    HAS_AKSHARE = True
-except ImportError:
-    HAS_AKSHARE = False
-    print("⚠️ 未安装 akshare，无法获取热门板块，将只抓取目标行业研报。")
 
 # ========== 配置 ==========
 TARGET_INDUSTRIES = ["证券", "银行", "保险"]      # 目标行业关键词
@@ -43,19 +36,44 @@ def fetch_all_reports():
         print(f"获取研报列表失败: {e}")
         return []
 
-def get_hot_sectors():
-    """获取当日涨幅前 N 的行业板块名称"""
-    if not HAS_AKSHARE:
-        return []
+def get_hot_sectors_from_api():
+    """
+    从东方财富 API 获取当日涨幅前 N 的行业板块名称
+    使用公开接口，无需登录
+    """
+    url = "https://push2.eastmoney.com/api/qt/clist/get"
+    params = {
+        "pn": 1,
+        "pz": 100,
+        "po": 1,
+        "np": 1,
+        "ut": "bd1d9ddb04089788cf9c27a6c742273c",
+        "fltt": 2,
+        "invt": 2,
+        "fid": "f3",          # 按涨跌幅排序
+        "fs": "m:90+t:2",     # 行业板块
+        "fields": "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f12,f13,f14,f15,f16,f17,f18,f19,f20,f21,f22,f23,f24,f25,f26,f27,f28,f29,f30,f31,f32,f33,f34,f35,f36,f37,f38,f39,f40,f41,f42,f43,f44,f45,f46,f47,f48,f49,f50,f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65,f66,f67,f68,f69,f70,f71,f72,f73,f74,f75,f76,f77,f78,f79,f80,f81,f82,f83,f84,f85,f86,f87,f88,f89,f90,f91,f92,f93,f94,f95,f96,f97,f98,f99,f100"
+    }
+    headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        df = ak.stock_board_industry_name_em()
-        # 按涨跌幅降序排列
-        df = df.sort_values("change", ascending=False)
-        hot = df.head(HOT_SECTOR_COUNT)["名称"].tolist()
-        print(f"热门板块: {hot}")
-        return hot
+        resp = requests.get(url, params=params, headers=headers, timeout=10)
+        data = resp.json()
+        if data.get('data') and data['data'].get('diff'):
+            items = data['data']['diff']
+            # 提取名称和涨跌幅，按涨跌幅降序排列（API已排序，但为确保）
+            # 取前 HOT_SECTOR_COUNT 个
+            hot = []
+            for item in items[:HOT_SECTOR_COUNT]:
+                name = item.get('f14')
+                if name:
+                    hot.append(name)
+            print(f"从API获取热门板块: {hot}")
+            return hot
+        else:
+            print("API返回数据为空")
+            return []
     except Exception as e:
-        print(f"获取热门板块失败: {e}")
+        print(f"获取热门板块API失败: {e}")
         return []
 
 def filter_reports_by_keywords(reports, keywords):
@@ -90,7 +108,7 @@ def generate_markdown_report(reports, date_str, target_keywords, hot_keywords):
     lines.append("")
     lines.append("---")
     lines.append("")
-    lines.append("> 数据来源：东方财富研报中心")
+    lines.append("> 数据来源：东方财富研报中心 & 行业资金流向API")
     lines.append("> 本报告仅包含研报元数据，不含PDF原文。如需详情，请访问东方财富研报中心。")
     
     return "\n".join(lines)
@@ -118,13 +136,12 @@ def main():
         # 否则，先取全部目标行业研报
         final_reports = target_reports[:]
         # 获取热门板块
-        hot_sectors = get_hot_sectors()
+        hot_sectors = get_hot_sectors_from_api()
         # 从所有研报中过滤出热门板块的研报（排除已选中的）
         existing_titles = {r.get("title", "") for r in final_reports}
         extra_reports = []
         for sector in hot_sectors:
             # 注意：热门板块名称可能和研报中的 industryName 不完全一致，但通常包含关键词
-            # 简单用包含匹配
             for r in all_reports:
                 title = r.get("title", "")
                 if title in existing_titles:
