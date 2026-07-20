@@ -1,17 +1,16 @@
 # daily_report_fetcher.py
-# 每日抓取指定行业（证券、银行、保险）+ 补足热门板块研报，生成 Markdown 报告
-# 使用 requests 直接调用东方财富 API 获取热门板块
+# 每日抓取指定行业（证券、银行、保险）+ 从研报数据中统计热门板块补充，生成 Markdown 报告
 
 import os
 import re
 import json
 import requests
 from datetime import datetime
+from collections import Counter
 
 # ========== 配置 ==========
 TARGET_INDUSTRIES = ["证券", "银行", "保险"]      # 目标行业关键词
 TARGET_COUNT = 10                                 # 期望总份数
-HOT_SECTOR_COUNT = 5                              # 补充用的热门板块个数
 # ==========================
 
 def fetch_all_reports():
@@ -27,53 +26,12 @@ def fetch_all_reports():
         if not match:
             return []
         json_str = match.group(1)
-        # 处理可能的不合规JSON
         json_str = re.sub(r',\s*}', '}', json_str)
         json_str = re.sub(r',\s*]', ']', json_str)
         data_obj = json.loads(json_str)
         return data_obj.get("data", [])
     except Exception as e:
         print(f"获取研报列表失败: {e}")
-        return []
-
-def get_hot_sectors_from_api():
-    """
-    从东方财富 API 获取当日涨幅前 N 的行业板块名称
-    使用公开接口，无需登录
-    """
-    url = "https://push2.eastmoney.com/api/qt/clist/get"
-    params = {
-        "pn": 1,
-        "pz": 100,
-        "po": 1,
-        "np": 1,
-        "ut": "bd1d9ddb04089788cf9c27a6c742273c",
-        "fltt": 2,
-        "invt": 2,
-        "fid": "f3",          # 按涨跌幅排序
-        "fs": "m:90+t:2",     # 行业板块
-        "fields": "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f12,f13,f14,f15,f16,f17,f18,f19,f20,f21,f22,f23,f24,f25,f26,f27,f28,f29,f30,f31,f32,f33,f34,f35,f36,f37,f38,f39,f40,f41,f42,f43,f44,f45,f46,f47,f48,f49,f50,f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65,f66,f67,f68,f69,f70,f71,f72,f73,f74,f75,f76,f77,f78,f79,f80,f81,f82,f83,f84,f85,f86,f87,f88,f89,f90,f91,f92,f93,f94,f95,f96,f97,f98,f99,f100"
-    }
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        resp = requests.get(url, params=params, headers=headers, timeout=10)
-        data = resp.json()
-        if data.get('data') and data['data'].get('diff'):
-            items = data['data']['diff']
-            # 提取名称和涨跌幅，按涨跌幅降序排列（API已排序，但为确保）
-            # 取前 HOT_SECTOR_COUNT 个
-            hot = []
-            for item in items[:HOT_SECTOR_COUNT]:
-                name = item.get('f14')
-                if name:
-                    hot.append(name)
-            print(f"从API获取热门板块: {hot}")
-            return hot
-        else:
-            print("API返回数据为空")
-            return []
-    except Exception as e:
-        print(f"获取热门板块API失败: {e}")
         return []
 
 def filter_reports_by_keywords(reports, keywords):
@@ -87,12 +45,32 @@ def filter_reports_by_keywords(reports, keywords):
                 break
     return result
 
-def generate_markdown_report(reports, date_str, target_keywords, hot_keywords):
-    """生成 Markdown 格式的研报汇总，并标注来源"""
+def get_hot_industries_from_reports(reports, exclude_keywords, top_n=10):
+    """
+    从研报数据中统计各行业出现次数，排除目标行业关键词，返回出现次数最多的行业名称列表
+    """
+    # 统计所有研报的行业名称出现次数
+    industry_counts = Counter()
+    for r in reports:
+        industry = r.get("industryName", "")
+        if not industry:
+            continue
+        # 检查是否属于目标行业（排除）
+        is_target = any(kw in industry for kw in exclude_keywords)
+        if not is_target:
+            industry_counts[industry] += 1
+    
+    # 按出现次数降序取前 top_n
+    hot_industries = [item[0] for item in industry_counts.most_common(top_n)]
+    print(f"从研报统计的热门行业: {hot_industries}")
+    return hot_industries
+
+def generate_markdown_report(reports, date_str, target_keywords, hot_industries):
+    """生成 Markdown 格式的研报汇总"""
     lines = [
         f"# 行业研报汇总 - {date_str}",
         "",
-        f"共收录 {len(reports)} 份研报（目标行业: {', '.join(target_keywords)}；补充热点: {', '.join(hot_keywords) if hot_keywords else '无'}）",
+        f"共收录 {len(reports)} 份研报（目标行业: {', '.join(target_keywords)}；补充来源: 研报统计热门行业）",
         "",
         "| 序号 | 标题 | 机构 | 评级 | 日期 | 行业 |",
         "| --- | --- | --- | --- | --- | --- |"
@@ -108,8 +86,8 @@ def generate_markdown_report(reports, date_str, target_keywords, hot_keywords):
     lines.append("")
     lines.append("---")
     lines.append("")
-    lines.append("> 数据来源：东方财富研报中心 & 行业资金流向API")
-    lines.append("> 本报告仅包含研报元数据，不含PDF原文。如需详情，请访问东方财富研报中心。")
+    lines.append("> 数据来源：东方财富研报中心")
+    lines.append("> 补充行业基于当天研报的行业分布统计，反映当日市场关注热点。")
     
     return "\n".join(lines)
 
@@ -131,23 +109,21 @@ def main():
     # 3. 如果目标行业研报数量 >= 目标数，直接取前目标数
     if len(target_reports) >= TARGET_COUNT:
         final_reports = target_reports[:TARGET_COUNT]
-        hot_keywords = []
+        hot_industries = []
     else:
         # 否则，先取全部目标行业研报
         final_reports = target_reports[:]
-        # 获取热门板块
-        hot_sectors = get_hot_sectors_from_api()
-        # 从所有研报中过滤出热门板块的研报（排除已选中的）
+        # 从所有研报中统计热门行业（排除目标行业）
+        hot_industries = get_hot_industries_from_reports(all_reports, TARGET_INDUSTRIES, top_n=10)
+        # 从所有研报中过滤出热门行业的研报（排除已选中的）
         existing_titles = {r.get("title", "") for r in final_reports}
         extra_reports = []
-        for sector in hot_sectors:
-            # 注意：热门板块名称可能和研报中的 industryName 不完全一致，但通常包含关键词
+        for industry in hot_industries:
             for r in all_reports:
                 title = r.get("title", "")
                 if title in existing_titles:
                     continue
-                industry = r.get("industryName", "")
-                if sector in industry or industry in sector:
+                if r.get("industryName", "") == industry:
                     extra_reports.append(r)
                     existing_titles.add(title)
                     if len(final_reports) + len(extra_reports) >= TARGET_COUNT:
@@ -155,7 +131,6 @@ def main():
             if len(final_reports) + len(extra_reports) >= TARGET_COUNT:
                 break
         final_reports.extend(extra_reports)
-        hot_keywords = hot_sectors[:len(extra_reports)] if extra_reports else []
     
     # 4. 去重（按标题）
     seen = set()
@@ -175,7 +150,7 @@ def main():
     os.makedirs(report_dir, exist_ok=True)
     md_path = os.path.join(report_dir, f"{today}_研报汇总.md")
     
-    content = generate_markdown_report(final_reports, today, TARGET_INDUSTRIES, hot_keywords)
+    content = generate_markdown_report(final_reports, today, TARGET_INDUSTRIES, hot_industries if 'hot_industries' in locals() else [])
     with open(md_path, "w", encoding="utf-8") as f:
         f.write(content)
     
